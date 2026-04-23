@@ -5,314 +5,466 @@
 
 ## Executive Summary
 
-The health score is a **two-dimensional risk model** based on:
+The health score is a **composite index** that combines:
+- **Frequency shift** (how much the bridge's natural frequency has changed)
+- **Modal variance** (how unstable/unclear the frequency measurement is)
+- **Measurement confidence** (how reliable is the extracted frequency)
+- **Baseline maturity** (do we have enough trips to trust the baseline)
 
-1. **Frequency Shift** (Δf) — how much the bridge's natural frequency has changed from baseline
-2. **Variance Increase** (Δσ) — loss of modal clarity (unstable/degrading structure)
-
-Together, these indicate **structural stiffness loss** (primary failure mode for bridges: cracks, scour, corrosion).
-
-**Score Range**: 0–100
-- **Green (75–100)**: Normal operation, low risk
-- **Yellow (30–74)**: Moderate warning, increased monitoring recommended
-- **Red (0–29)**: Critical alert, immediate inspection required
+It produces a **categorical output** (Red/Yellow/Green) with a **numeric score** (0–100) and **confidence interval** suitable for insurance decision-making.
 
 ---
 
-## Mathematical Framework
+## Part 1: Definitions
 
-### 1. Baseline Computation
+### 1.1 Baseline Signature
 
-After **N ≥ 30 valid trips** on a bridge, the backend computes baseline statistics:
-
-```
-f_baseline = mean(dominant_frequency across N trips)
-σ_f = stddev(dominant_frequency across N trips)
-
-v_baseline = mean(peak_variance across N trips)
-σ_v = stddev(peak_variance across N trips)
-
-confidence_baseline = N / 50  (normalized to 0..1, capped at 1 when N ≥ 50)
-```
-
-**Rationale**: 
-- 30 trips = ~6–10 days of commuter traffic on a bridge (minimal variability)
-- 50+ trips = locked-in signature (high confidence)
-- Both frequency mean and variance matter (first derivative = stiffness, second = instability)
-
-### 2. Single-Trip Risk Metrics
-
-For each new trip, compute two normalized deviations:
-
-#### A. Frequency Shift (Δf)
+After **N_baseline = 30 valid trips** on a bridge, we compute:
 
 ```
-Δf_raw = |f_current - f_baseline|
-
-z_freq = Δf_raw / σ_f   (units: standard deviations)
+f_baseline = mean(f₁, f₂, ..., f₃₀)           [Hz]
+σ_f = stddev(f₁, f₂, ..., f₃₀)                [Hz]
+v_baseline = mean(peak_variance₁, ..., peak_variance₃₀)  [Hz²]
+σ_v = stddev(peak_variance₁, ..., peak_variance₃₀)      [Hz²]
 ```
 
-**Interpretation**:
-- `z_freq = 0.5`: Frequency is 0.5σ from baseline (normal noise)
-- `z_freq = 1.0`: Frequency is 1σ from baseline (noticeable shift, but within 1 std)
-- `z_freq = 2.0`: Frequency is 2σ from baseline (rare, 2.3% probability if normal distribution)
-- `z_freq > 2.5`: Significant structural change
+These **do not change** for 30 days (unless anomaly triggers a recompute).
 
-#### B. Variance Increase (Δσ)
+### 1.2 Current Measurement
+
+For each new trip, we extract:
 
 ```
-Δσ_raw = v_current / v_baseline   (ratio, not difference)
-
-If v_baseline is very small (unstable baseline), use floor: Δσ_raw = max(1.0, ratio)
+f_current = dominant peak frequency              [Hz]
+c_freq = frequency detection confidence          [0..1]
+v_current = variance in peak detection           [Hz²]
+N_trips = total valid trips on this bridge       [count]
 ```
 
-**Interpretation**:
-- `Δσ = 1.0`: Variance unchanged (stable)
-- `Δσ = 1.5`: Variance increased 50% (loss of clarity)
-- `Δσ = 2.0`: Variance doubled (significant instability)
-- `Δσ > 2.5`: Imminent failure signature
+### 1.3 Deviation Metrics
 
-### 3. Health Score Function
-
-The score is computed in two stages:
-
-#### Stage 1: Individual Risk Signals
-
-```python
-def risk_from_frequency(z_freq):
-    """
-    Convert frequency z-score to risk (0..1).
-    Smooth sigmoid curve: gradual increase in risk as shift grows.
-    """
-    if z_freq < 0.5:
-        return 0.0  # Normal noise
-    
-    # Sigmoid function: smooth transition from 0 to 1
-    # 50% risk at z=1.5, 95% risk at z=3.0
-    risk_freq = 1 / (1 + exp(-(z_freq - 1.5) / 0.5))
-    return min(risk_freq, 1.0)
-
-def risk_from_variance(delta_sigma):
-    """
-    Convert variance ratio to risk (0..1).
-    """
-    if delta_sigma < 1.2:
-        return 0.0  # Normal fluctuation
-    
-    # Linear ramp: 0 risk at 1.2x, 100% risk at 2.5x baseline
-    risk_var = max(0, (delta_sigma - 1.2) / (2.5 - 1.2))
-    return min(risk_var, 1.0)
+```
+Δf = |f_current - f_baseline|                   [Hz, absolute shift]
+z_f = Δf / σ_f                                  [dimensionless, # of std devs]
+Δv = v_current / v_baseline                     [dimensionless, multiplier]
 ```
 
-#### Stage 2: Combined Risk Score
+**Interpretation:**
+- `z_f = 1.0`: Frequency shifted by 1 standard deviation (normal variability)
+- `z_f = 2.0`: Frequency shifted by 2 standard deviations (notable change)
+- `z_f = 3.0`: Frequency shifted by 3 standard deviations (strong evidence of damage)
 
-```python
-def compute_health_score(z_freq, delta_sigma, confidence_baseline):
-    """
-    Combine individual risk signals into a single 0-100 score.
-    
-    Confidence weighting: if baseline is weak (<30 trips), rely more on jerk detection.
-    If baseline is strong (50+ trips), use full algorithm.
-    """
-    risk_freq = risk_from_frequency(z_freq)
-    risk_var = risk_from_variance(delta_sigma)
-    
-    # Combine risks with AND logic (both must be high for critical alert)
-    # BUT: if one is very high, override
-    if risk_freq > 0.95 or risk_var > 0.95:
-        combined_risk = max(risk_freq, risk_var)  # Override threshold
-    else:
-        # Weighted average: frequency shift is primary indicator (60% weight)
-        combined_risk = 0.6 * risk_freq + 0.4 * risk_var
-    
-    # Apply confidence penalty: if baseline is weak, boost caution
-    # Low confidence (N=30) → penalize score by -10
-    # High confidence (N≥50) → no penalty
-    confidence_penalty = (1 - confidence_baseline) * 10  # 0..10 point deduction
-    
-    # Convert risk (0..1) to score (0..100), inverted
-    score = 100 * (1 - combined_risk) - confidence_penalty
-    
-    return max(0, min(100, score))  # Clamp to [0, 100]
+---
 
-def health_status(score):
-    if score >= 75:
-        return 'Green'
-    elif score >= 30:
-        return 'Yellow'
-    else:
-        return 'Red'
+## Part 2: Health Score Formula
+
+### 2.1 Baseline Maturity Check
+
+```
+if N_trips < 30:
+    return { health: 'Unknown', score: null, reason: 'Insufficient baseline data' }
+```
+
+**Explanation**: We do not score until we have at least 30 valid trips. The first 30 trips are used to *learn* the baseline, not to evaluate it.
+
+### 2.2 Risk Assessment Matrix
+
+We evaluate **two independent risk factors**:
+
+#### Factor A: Frequency Shift Risk
+
+```
+if z_f > 3.0:
+    freq_risk = 'critical'      # Very strong evidence of stiffness loss
+elif z_f > 2.0:
+    freq_risk = 'high'          # Strong evidence
+elif z_f > 1.0:
+    freq_risk = 'moderate'      # Noticeable change
+else:
+    freq_risk = 'low'           # Within normal variability
+```
+
+#### Factor B: Modal Clarity Risk
+
+```
+if Δv > 3.0:
+    clarity_risk = 'critical'   # Frequency very unstable (many modes visible)
+elif Δv > 2.0:
+    clarity_risk = 'high'       # Noticeably more unclear
+elif Δv > 1.5:
+    clarity_risk = 'moderate'   # Slight increase in instability
+else:
+    clarity_risk = 'low'        # Stable modal signature
+```
+
+#### Factor C: Confidence Risk
+
+```
+if c_freq < 0.4:
+    confidence_risk = 'critical'  # Measurement unreliable
+elif c_freq < 0.6:
+    confidence_risk = 'high'      # Borderline
+else:
+    confidence_risk = 'low'       # Good measurement
+```
+
+### 2.3 Risk Aggregation Matrix
+
+Combine the three factors to assign **health status**:
+
+```
+RED if:
+  (freq_risk = 'critical' AND clarity_risk >= 'moderate')
+  OR (freq_risk = 'high' AND clarity_risk = 'critical')
+  OR (freq_risk = 'high' AND clarity_risk = 'high' AND confidence_risk = 'low')
+  → Score: 25 (High risk of structural damage)
+
+YELLOW if:
+  (freq_risk = 'high' AND clarity_risk = 'low')
+  OR (freq_risk = 'moderate' AND clarity_risk >= 'moderate')
+  OR (confidence_risk = 'critical')
+  → Score: 50 (Monitor, collect more data)
+
+GREEN if:
+  freq_risk = 'low' OR clarity_risk = 'low'
+  (AND NOT any 'critical' risks)
+  → Score: 75 (Normal operation)
+
+UNKNOWN if:
+  N_trips < 30
+  → Score: null (Not yet scored)
 ```
 
 ---
 
-## Threshold Decision Table
+## Part 3: Detailed Scoring Logic (Pseudocode)
 
-| Scenario | z_freq | Δσ | Baseline | Result | Rationale |
-|----------|--------|-----|----------|--------|-----------|
-| **Normal operation** | 0.2 | 1.0 | N=50 | Green (92) | No frequency shift, stable variance |
-| **Measurement noise** | 0.8 | 1.1 | N=50 | Green (85) | Small shifts within ±1σ are normal |
-| **Minor alert** | 1.5 | 1.4 | N=50 | Yellow (58) | 1.5σ shift + 40% variance increase |
-| **Moderate alert** | 2.0 | 1.8 | N=50 | Yellow (42) | 2σ shift + 80% variance increase |
-| **Severe alert** | 2.5 | 2.2 | N=50 | Red (15) | 2.5σ shift + 120% variance increase |
-| **Critical alert** | 3.0 | 2.5 | N=50 | Red (5) | Extreme frequency shift + high instability |
-| **Weak baseline** | 1.2 | 1.3 | N=25 | Yellow (45) | Same risk metrics, but lower confidence |
-
----
-
-## Failure Mode Mapping
-
-| Bridge Failure | Expected Signature | z_freq | Δσ |
-|---|---|---|---|
-| **Hairline crack (early)** | Stiffness loss, stable modes | 1.0–1.5 | 1.2–1.5 |
-| **Crack (propagating)** | Significant stiffness loss, mode splitting | 2.0–2.5 | 1.5–2.0 |
-| **Scour (foundation)** | Dramatic frequency drop, mode confusion | 2.5–3.5 | 2.0–2.5 |
-| **Corrosion (cables/joints)** | Frequency drift + damping increase | 1.5–2.5 | 1.8–2.5 |
-| **Temporary: vehicle mass** | Frequency drop only, variance stable | 1.0–2.0 | <1.2 |
-| **Temporary: wind/weather** | Both shift + variance, then revert | 1.5–2.5 | 1.5–2.0 |
-
-**Key insight**: Structural damage shows **both** frequency shift AND variance increase. Environmental factors often show only one or neither.
-
----
-
-## Baseline Stability & Confidence
-
-### Baseline Lock-In Timeline
-
-| Trips | Days (est.) | Confidence | Status |
-|-------|-------------|-----------|--------|
-| 10–20 | 2–4 | "Learning" (score disabled) | Do not compute health yet |
-| 20–30 | 4–7 | 66% | Compute score, but interpret cautiously |
-| 30–50 | 7–14 | 76–100% | Baseline locked, full algorithm active |
-| 50+ | 14+ | 100% | Confident baseline; algorithm fully calibrated |
-
-**Rule**: Do not compute health scores until **N ≥ 20**. Before that, only use jerk detection.
-
-### Baseline Drift Handling
-
-If the baseline itself appears to be drifting (e.g., seasonal temperature changes), recompute baseline quarterly:
-
-```python
-def should_recompute_baseline(trips_past_90_days, trips_total):
-    """
-    If last 90 days show significant divergence from all-time baseline,
-    recompute with recent data only (more responsive to real changes).
-    """
-    if trips_past_90_days < 15:
-        return False  # Not enough recent data
-    
-    recent_mean = mean(trips_past_90_days.frequency)
-    overall_mean = mean(trips_total.frequency)
-    
-    if abs(recent_mean - overall_mean) > 2 * overall_std:
-        return True  # Drift detected, re-baseline
-    
-    return False
+```
+function compute_health_score(
+  f_current,        # Hz
+  c_freq,           # 0..1
+  v_current,        # Hz²
+  f_baseline,       # Hz
+  σ_f,              # Hz
+  v_baseline,       # Hz²
+  σ_v,              # Hz²
+  N_trips           # count
+):
+  
+  # Check baseline maturity
+  if N_trips < 30:
+    return {
+      health: 'Unknown',
+      score: null,
+      reason: 'Insufficient data (< 30 trips)',
+      trip_count: N_trips
+    }
+  
+  # Compute deviations
+  Δf = abs(f_current - f_baseline)
+  z_f = Δf / max(σ_f, 0.05)  # Avoid division by zero; use 0.05 Hz floor
+  Δv = v_current / max(v_baseline, 0.01)  # Floor variance at 0.01 Hz²
+  
+  # Factor A: Frequency shift risk
+  if z_f > 3.0:
+    freq_risk_score = 0
+  elif z_f > 2.0:
+    freq_risk_score = 25
+  elif z_f > 1.0:
+    freq_risk_score = 50
+  else:
+    freq_risk_score = 75
+  
+  # Factor B: Modal clarity risk (variance)
+  if Δv > 3.0:
+    clarity_risk_score = 0
+  elif Δv > 2.0:
+    clarity_risk_score = 25
+  elif Δv > 1.5:
+    clarity_risk_score = 50
+  else:
+    clarity_risk_score = 75
+  
+  # Factor C: Measurement confidence
+  if c_freq < 0.4:
+    confidence_penalty = 50  # Reduce score by 50 points
+  elif c_freq < 0.6:
+    confidence_penalty = 25
+  else:
+    confidence_penalty = 0
+  
+  # Combine: take minimum of the three (most conservative)
+  raw_score = min(freq_risk_score, clarity_risk_score) - confidence_penalty
+  final_score = max(0, min(100, raw_score))  # Clamp to [0, 100]
+  
+  # Map to categorical health
+  if final_score < 35:
+    health = 'Red'
+  elif final_score < 65:
+    health = 'Yellow'
+  else:
+    health = 'Green'
+  
+  return {
+    health: health,
+    score: final_score,
+    z_f: z_f,
+    Δv: Δv,
+    c_freq: c_freq,
+    details: {
+      frequency_shift_hz: Δf,
+      frequency_shift_sigma: z_f,
+      variance_increase: Δv,
+      confidence: c_freq
+    }
+  }
 ```
 
 ---
 
-## Insurance-Friendly Reporting
+## Part 4: Calibration & Real-World Mapping
 
-### Risk Score Conversion for Actuaries
+### 4.1 What Do These Numbers Actually Mean?
 
-Convert health score to **bridge repair cost risk**:
+**Frequency shift (z_f)** correlates to:
 
-```python
-def annual_cost_risk(health_status, bridge_age_years, avg_aadt):
-    """
-    Estimate expected annual repair/replacement costs (in units of $100k).
-    Inputs:
-      health_status: 'Green', 'Yellow', 'Red'
-      bridge_age_years: age of bridge
-      avg_aadt: Average Annual Daily Traffic
-    """
-    base_cost = 0
-    
-    if health_status == 'Green':
-        base_cost = 0.05 * (bridge_age_years / 50)  # Minimal risk
-    elif health_status == 'Yellow':
-        base_cost = 0.30 * (bridge_age_years / 50)  # Monitoring costs
-    else:  # Red
-        base_cost = 1.50 * (bridge_age_years / 50)  # Repair/failure costs
-    
-    # Traffic-weighted: high-traffic bridges = higher consequence
-    traffic_multiplier = 1 + (avg_aadt / 50000)  # Normalized to 50k AADT
-    
-    return base_cost * traffic_multiplier
+| z_f | Physical Interpretation | Example |
+|-----|-------------------------|---------|
+| 0.0–0.5 | Normal measurement variability | Temperature swing, traffic loading |
+| 0.5–1.0 | Borderline change | Slight corrosion, minor settling |
+| 1.0–2.0 | Noticeable change | Rust on cables, 2–5 mm deflection increase |
+| 2.0–3.0 | Significant change | Active crack (< 2mm), scour (early stage) |
+| > 3.0 | Critical | Serious structural damage, imminent failure |
+
+**Frequency shift in Hz → Structural consequence:**
+
+For a typical 200m steel bridge with f_baseline = 2.0 Hz:
+
+```
+Δf = 0.1 Hz (5%)  → σ ≈ 0.05 Hz   → z_f ≈ 2.0  → High risk
+Δf = 0.05 Hz (2.5%) → σ ≈ 0.05 Hz → z_f ≈ 1.0  → Moderate
+Δf = 0.02 Hz (1%) → σ ≈ 0.05 Hz  → z_f ≈ 0.4  → Low
 ```
 
-**Example**:
-- Golden Gate Bridge: Red alert, 70 years old, 120k AADT
-- Risk = 1.50 * (70/50) * (1 + 120k/50k) = **$12.6M/year** expected cost
+A **5% frequency drop** suggests:
+- **Stiffness loss of ~10%** (linear relationship: f ∝ √k)
+- Concrete: significant micro-cracking, steel: corrosion/loss of section
+- **Action**: Visual inspection within 2 weeks
 
-This is the **value proposition** for insurance companies: avoid catastrophic failures.
+### 4.2 Modal Variance (Δv)
+
+**Why it matters**: If the peak detection suddenly sees *multiple* peaks of similar height, it means the bridge's modal response is becoming unstable — a sign of incipient failure.
+
+| Δv | Meaning |
+|-----|---------|
+| < 1.2 | Very stable; clear dominant mode |
+| 1.2–1.5 | Slight increase in secondary modes |
+| 1.5–2.0 | Modal coupling (damping increasing) |
+| > 2.0 | Multiple competing modes (possible failure mode change) |
+
+### 4.3 Confidence (c_freq)
+
+**Low confidence** (c_freq < 0.6) can occur because:
+- Heavy traffic during measurement (noise dominates signal)
+- Wind buffeting (broad spectral response)
+- Temperature instability (multiple frequency peaks)
+- Poor accelerometer placement
+
+**Action on low confidence**: Collect more trips before drawing conclusions.
 
 ---
 
-## Calibration & Tuning
+## Part 5: Examples
 
-### Sensitivity Analysis: How to Adjust Thresholds
+### Example 1: Stable Bridge (Green)
 
-```python
-def sensitivity_analysis():
-    """
-    Test how score changes with parameter variations.
-    Use this to calibrate after collecting real-world failure data.
-    """
-    test_cases = [
-        {'z_freq': 1.5, 'delta_sigma': 1.4, 'expected_health': 'Yellow'},
-        {'z_freq': 2.0, 'delta_sigma': 1.8, 'expected_health': 'Yellow'},
-        {'z_freq': 2.5, 'delta_sigma': 2.2, 'expected_health': 'Red'},
-    ]
-    
-    for case in test_cases:
-        score = compute_health_score(case['z_freq'], case['delta_sigma'], 1.0)
-        status = health_status(score)
-        
-        if status == case['expected_health']:
-            print(f"✓ Pass: z_freq={case['z_freq']}, delta_sigma={case['delta_sigma']} → {status}")
-        else:
-            print(f"✗ FAIL: Expected {case['expected_health']}, got {status}")
-            print(f"        Adjust sigmoid curves or thresholds")
+```
+Baseline (30 trips):
+  f_baseline = 2.50 Hz, σ_f = 0.08 Hz
+  v_baseline = 0.15 Hz², σ_v = 0.05 Hz²
+
+New trip:
+  f_current = 2.51 Hz
+  c_freq = 0.92
+  v_current = 0.16 Hz²
+
+Computation:
+  Δf = |2.51 - 2.50| = 0.01 Hz
+  z_f = 0.01 / 0.08 = 0.125 → freq_risk = 'low' (75 pts)
+  Δv = 0.16 / 0.15 = 1.07 → clarity_risk = 'low' (75 pts)
+  confidence_risk = 'low' (0 pt penalty)
+  
+  raw_score = min(75, 75) - 0 = 75
+  
+Result:
+  ✓ GREEN (Score 75)
+  "Bridge operating normally. No action required."
 ```
 
-### When to Re-Calibrate
+### Example 2: Concerning Trend (Yellow)
 
-1. **After first failure**: If a Red-alert bridge fails → validate thresholds
-2. **After 100+ bridges**: Enough data to see if Yellow alerts correlate with repairs
-3. **Annually**: Review false positive/negative rates with insurance claims data
+```
+Baseline (30 trips):
+  f_baseline = 2.50 Hz, σ_f = 0.08 Hz
+  v_baseline = 0.15 Hz²
+
+New trip (day 40):
+  f_current = 2.35 Hz (Δf = 0.15 Hz, -6%)
+  c_freq = 0.75
+  v_current = 0.25 Hz² (Δv = 1.67)
+
+Computation:
+  z_f = 0.15 / 0.08 = 1.875 → freq_risk = 'high' (25 pts)
+  Δv = 0.25 / 0.15 = 1.67 → clarity_risk = 'moderate' (50 pts)
+  confidence_risk = 'low' (0 pt penalty)
+  
+  raw_score = min(25, 50) - 0 = 25
+  
+Result:
+  ⚠ RED (Score 25)
+  "Frequency shift of 1.9σ detected. High risk of stiffness loss.
+   Recommend visual inspection + follow-up measurements in 3–5 days."
+```
+
+Wait, this should be RED, not YELLOW. Let me recalculate:
+
+```
+freq_risk = 'high' (z_f = 1.875, between 1.0 and 2.0)
+clarity_risk = 'moderate' (Δv = 1.67, between 1.5 and 2.0)
+
+Matrix: high + moderate = RED
+Final score = 25
+```
+
+### Example 3: High Variance, Low Confidence (Yellow)
+
+```
+Baseline:
+  f_baseline = 3.20 Hz, σ_f = 0.10 Hz
+  v_baseline = 0.20 Hz²
+
+New trip (windy conditions):
+  f_current = 3.18 Hz
+  c_freq = 0.45 (low: wind noise)
+  v_current = 0.50 Hz² (Δv = 2.5)
+
+Computation:
+  z_f = 0.02 / 0.10 = 0.2 → freq_risk = 'low' (75 pts)
+  Δv = 0.50 / 0.20 = 2.5 → clarity_risk = 'high' (25 pts)
+  confidence_risk = 'high' (25 pt penalty)
+  
+  raw_score = min(75, 25) - 25 = 0
+  
+Result:
+  ⚠ RED (Score 0)
+  "High measurement uncertainty + increased modal variance.
+   Cannot assess health. Recommend collecting trip in calmer conditions."
+```
 
 ---
 
-## Implementation Checklist
+## Part 6: Temporal Tracking & Trend Analysis
 
-- [ ] Baseline computation: mean frequency + std + variance (N ≥ 30)
-- [ ] Z-score calculation for frequency shift
-- [ ] Variance ratio calculation
-- [ ] Sigmoid risk curves (configurable via environment)
-- [ ] Combined risk logic (AND vs weighted average)
-- [ ] Confidence weighting (based on N)
-- [ ] Health status determination (Green/Yellow/Red)
-- [ ] Insurance cost mapping (optional)
-- [ ] Sensitivity analysis framework
-- [ ] Logging/auditing of score changes (for legal defensibility)
+Health status is **instantaneous** (based on the latest trip), but **insurance decision-makers care about trends**.
 
----
+Compute a **7-day rolling baseline** to detect drift:
 
-## Next Steps After Deployment
+```
+Last 7 days of valid trips:
+  f_7d_mean = mean(f_t-6, f_t-5, ..., f_t)
+  f_7d_trend = (f_t - f_t-6) / 6 days  [Hz/day]
+  
+if f_7d_trend < -0.01 Hz/day:
+  # Frequency dropping > 1% per day
+  # Accelerated stiffness loss → ESCALATE TO RED even if current trip is Yellow
+```
 
-1. **Pilot Phase (Month 1–3)**: Collect baseline on 20+ bridges
-2. **Validation Phase (Month 3–6)**: Compare alerts to engineering inspections
-3. **Calibration Phase (Month 6–12)**: Adjust thresholds based on validation data
-4. **Production (Year 1+)**: Full deployment with insurance integration
-
-**Success Metric**: Yellow/Red alerts should correlate with engineering findings at >85% accuracy.
+**Trigger**: If score is Yellow AND frequency is drifting down, promote to Red.
 
 ---
 
-## References
+## Part 7: Calibration by Bridge Type
 
-- **ISO 13373-2**: Condition monitoring and diagnostics – Vibration condition monitoring – Part 2: Vibration diagnostics
-- **ASCE Infrastructure Report Card**: Bridge condition assessment frameworks
-- **Bendat & Piersol (2010)**: Random Data: Analysis and Measurement Procedures
+Different bridge types have different baseline variability (σ_f):
+
+| Bridge Type | Typical σ_f | Baseline Trips | Notes |
+|------------|-----------|----------------|-------|
+| Steel cable-stayed | 0.05–0.10 Hz | 30 | Low variance, very responsive |
+| Concrete beam | 0.10–0.20 Hz | 40–50 | Higher variability due to temperature |
+| Truss (steel) | 0.08–0.15 Hz | 35 | Moderate variability |
+| Suspension | 0.03–0.08 Hz | 50 | Very low variance, very sensitive |
+
+**Tuning strategy**:
+1. Collect 50 trips on known-healthy bridge of same type
+2. Measure actual σ_f
+3. Set alarm thresholds (z_f = 2.0 for "high risk") based on calibration data
+
+---
+
+## Part 8: Implementation Checklist
+
+- [ ] Compute f_baseline, σ_f, v_baseline, σ_v after 30 valid trips
+- [ ] For each new trip, extract f_current, c_freq, v_current
+- [ ] Compute z_f, Δv, confidence_risk
+- [ ] Apply risk matrix to assign health status
+- [ ] Store score + details in database (for auditing)
+- [ ] Compute 7-day trend (optional but recommended)
+- [ ] Trigger alerts when score drops to Red
+- [ ] Log every score transition (Green → Yellow, etc.) for audit
+- [ ] Validate thresholds with structural engineers (before deployment)
+
+---
+
+## Part 9: Uncertainty & Confidence Intervals
+
+For insurance reporting, include confidence bounds:
+
+```
+Score = 75 (Green)
+90% Confidence Interval: [68, 82]
+
+Interpretation:
+  "With 90% confidence, true health score is between 68 (Yellow boundary)
+   and 82 (deep Green). Current data: CONCLUSIVE GREEN."
+
+---
+
+Score = 50 (Yellow)
+90% Confidence Interval: [35, 65]
+
+Interpretation:
+  "With 90% confidence, true score is between 35 (Red boundary)
+   and 65 (Yellow boundary). Current data: INCONCLUSIVE.
+   Recommend additional measurements before action."
+```
+
+**Calculation**:
+```
+CI = score ± 1.645 × SE
+
+where SE = sqrt( (z_f_uncertainty)² + (Δv_uncertainty)² )
+      z_f_uncertainty = z_f × sqrt( (σ_f_error/σ_f)² + (measurement_noise)² )
+      Δv_uncertainty = Δv × sqrt( (σ_v_error/σ_v)² )
+```
+
+---
+
+## References & Future Work
+
+1. **Modal analysis best practices**: ISO 13373-1 (Vibration-based condition monitoring)
+2. **Structural health monitoring**: ASCE Guidelines for SHM (2017)
+3. **Insurance risk models**: Adapt standard bridge failure statistics to modal frequency thresholds
+4. **Calibration data**: Collect data on bridges that *actually failed* and work backwards to validate thresholds
+
+---
+
+## Summary: When to Alert Insurance
+
+| Health | Action | Timeline |
+|--------|--------|----------|
+| **Green** (score ≥ 70) | Routine monitoring | Continue normal collection |
+| **Yellow** (score 35–69) | Review + retest | Collect 5–10 more trips within 3 days |
+| **Red** (score < 35) | Visual inspection required | Within 48 hours |
+| **Red + downward trend** | Urgent closure / load limit | Within 24 hours |
+
+**Insurance claim trigger**: Two consecutive Red scores within 7 days → Notify underwriting immediately.
